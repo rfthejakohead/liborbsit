@@ -11,7 +11,7 @@ import math
 from websocket import create_connection
 
 class orbsItOrb:
-    def __init__(self, data):
+    def __init__(self, game, data):
         self.id = data["id"]
         self.owner = data["ownerId"]
         self.changedOwnerTime = data["changedOwnerTime"]
@@ -24,16 +24,100 @@ class orbsItOrb:
         self.distYChangeSpeed = data["orbitDist"]["distYChangeSpeed"]
         self.x = None
         self.y = None
+        self.scheduledTakeTime = 0
+        self.scheduledTakeBy = None
+        self.game = game
+        self.scheduledShieldTime = 0
+        self.scheduledSmartbombTime = 0
+        self.lastShot = 0
 
-    def update(self, gameTime):
-        ang = self.baseAng - gameTime / 15
-        distyfrac = abs(math.cos(self.distYCycleAng + self.distYChangeSpeed * gameTime))
+        if self.owner >= 0:
+            self.game.players[self.owner].orbs.append(self.id)
+
+    def posAtTime(self, time):
+        ang = self.baseAng - time / 15
+        distyfrac = abs(math.cos(self.distYCycleAng + self.distYChangeSpeed * time))
+        distY = self.distYMin + self.distYRange * distyfrac
+        return (self.distX * math.cos(ang), distY * math.sin(ang))
+
+    def velAtTime(self, time):
+        # This is a really dirty way to do it but its how the game does it.
+        # Should have used calculus and derived a formula instead
+        posA = self.posAtTime(time - 0.5)
+        posB = self.posAtTime(time + 0.5)
+        return (posB[0] - posA[0], posB[1] - posA[1])
+
+    def update(self):
+        ang = self.baseAng - self.game.gameTime / 15
+        distyfrac = abs(math.cos(self.distYCycleAng + self.distYChangeSpeed * self.game.gameTime))
         self.distY = self.distYMin + self.distYRange * distyfrac
         self.x = self.distX * math.cos(ang)
         self.y = self.distY * math.sin(ang)
+        if self.scheduledTakeTime > 0 and self.scheduledTakeTime <= self.game.gameTime:
+            self.scheduledTakeTime = 0
+            self.setOwner(self.scheduledTakeBy)
+            self.game.log("Orb " + str(self.id) + " taken by " + str(self.owner) + " as per schedule")
+        if self.scheduledSmartbombTime > 0 and self.scheduledSmartbombTime <= self.game.gameTime:
+            angle = 0.0
+            while angle <= 315.0:
+                self.shoot(self.scheduledSmartbombTime, (math.cos(0.0174533 * angle), math.sin(0.0174533 * angle)))
+                angle += 22.5
+            self.scheduledSmartbombTime = 0
+            self.game.log("Orb " + str(self.id) + " deployed smartbomb as per schedule")
 
     def setOwner(self, pid):
+        if self.owner >= 0:
+            self.game.players[self.owner].orbs.remove(self.id)
         self.owner = pid
+        self.game.players[self.owner].orbs.append(self.id)
+
+    def shoot(self, time, normal):
+        # Only verify countdown when player owns the orb (at playerShoot)
+        self.lastShot = time
+        # 250 is the impulse multiplier constant
+        impulse = (normal[0] * 250, normal[1] * 250)
+        self.game.bullets.append(orbsItBullet(self, time, impulse))
+
+    def playerShoot(self, clickPos):
+        # Just in case there is a race condition
+        # Its pointless to skip last shot time check as the server has
+        # anti-cheat which disconnects you when you shoot too often
+        if self.owner == self.game.playerId and self.game.gameTime - self.lastShot >= 2:
+            sx = clickPos[0] - self.x
+            sy = clickPos[1] - self.y
+            sd = math.sqrt(sx * sx + sy * sy)
+            sx /= sd
+            sy /= sd
+            self.shoot(self.game.gameTime, (sx, sy))
+            # Call your own shots. For some reason gameTime is not rounded to
+            # 4 decimal places in the original game code, so emulating JS limits
+            # here (float.toString rounds to 16 DP)
+            self.game.netSend("{:d}\t{:d}\t{:.16f}\t{:.4f}\t{:.4f}".format(self.game.commands["shoot"], self.id, self.game.gameTime, sx, sy))
+
+    def deployShield(self, time):
+        # Original game code only counts down 4.5 seconds, but doesn't pay
+        # attention to scheduled time deploy delay, so this will count time
+        # from deploy time instead of counting down 4.5 seconds fixing possible
+        # exploits
+        self.scheduledShieldTime = time
+
+    def shieldUp(self):
+        if self.game.gameTime >= self.scheduledShieldTime and self.game.gameTime < self.scheduledShieldTime + 4.5:
+            return True
+        return False
+
+    def playerShield(self):
+        # Just in case there is a race condition
+        if self.owner == self.game.playerId and not self.shieldUp() and self.game.myShields > 0:
+            self.game.netSend("{:d}\t{:d}\t{:.4f}".format(self.game.commands["deployShield"], self.id, self.game.gameTime))
+
+    def deploySmartbomb(self, time):
+        self.scheduledSmartbombTime = time
+
+    def playerSmartbomb(self):
+        # Just in case there is a race condition
+        if self.owner == self.game.playerId and self.scheduledSmartbombTime == 0 and self.game.mySmartbombs > 0:
+            self.game.netSend("{:d}\t{:d}\t{:.4f}".format(self.game.commands["deploySmartbomb"], self.id, self.game.gameTime))
 
 class orbsItPlayer:
     # Orb colours depending on user ID (max 8 players)
@@ -57,38 +141,102 @@ class orbsItPlayer:
 
         self.orbs = []
 
-    def addOrb(self, oid):
-        self.orbs.append(oid)
+class orbsItBullet:
+    def __init__(self, source, time, impulse):
+        self.game = source.game
+        # Start position. Current position will always be calculated from the
+        # start position, opposed to how the original game code does it, so that
+        # timed network exploits are prevented
+        self.vx, self.vy = source.velAtTime(time)
+        self.vx += impulse[0]
+        self.vy += impulse[1]
+        self.sx, self.sy = source.posAtTime(time)
+        self.sx += + self.vx / 10
+        self.sy += + self.vy / 10
+        self.x = self.sx
+        self.y = self.sy
+        self.owner = source.owner
+        self.source = source.id
+        self.birth = time # The lifespan of bullets is exactly 3 seconds
 
-    def remOrb(self, oid):
-        self.orbs.remove(oid)
+    def alive(self):
+        if self.game.gameTime < self.birth + 3:
+            return True
+        return False
+
+    def update(self):
+        lifespan = self.game.gameTime - self.birth
+        self.x = self.sx + self.vx * lifespan
+        self.y = self.sy + self.vy * lifespan
+
+        # Collision check with all orbs
+        for i, o in self.game.orbs.items():
+            # Skip source orb
+            if i != self.source:
+                # Normal hit distance is 32
+                # Shield hit distance is 47
+                dx = abs(self.x - o.x)
+                dy = abs(self.y - o.y)
+                d = math.sqrt(dx * dx + dy * dy)
+                hd = 47 if o.shieldUp() else 32
+                if d < hd:
+                    self.game.bullets.remove(self)
+                    if self.owner == self.game.playerId and o.owner != self.game.playerId and o.scheduledTakeTime == 0:
+                        # Call your own hits. There is room for exploit here...
+                        # plis dont
+                        self.game.netSend("{:d}\t{:d}\t{:d}\t{:.4f}\t{:.4f}".format(self.game.commands["orbHit"], o.id, self.source, self.birth, self.game.gameTime))
 
 class orbsItGame:
     # Game socket commands
     commands = {"joinGame": 6,
                 "gameStatus": 7,
                 "initialGameVars": 8,
+                "initialPlayerVars": 9,
+                "shoot": 10,
                 "orbHit": 11,
-                "eliminated": 14}
+                "eliminated": 14,
+                "deployShield": 21,
+                "deploySmartbomb": 23,
+                "bonusPowerup": 24}
 
-    def __init__(self, joinData, user, guid, log = True):
-        self.ws = create_connection("ws://" + joinData[0])
+    def __init__(self, joinData, user, guid, gameCode = None, log = True):
+        # Connection variables
         self.joinData = joinData
+        self.ws = create_connection("ws://" + joinData[0])
         self.connected = False
-        self.inGame = False
-        self.alive = False
-        self.gameVars = None
-        self.user = user
-        self.guid = guid
+
+        # Settings variables
         self.lastErr = ""
         self.printLog = log
+
+        # Global game variables
+        self.gameVars = None
+        self.inGame = False
         self.orbs = {}
         self.players = {}
+        self.bullets = []
+        self.gameStartTime = None
+        self.gameTime = None
+        self.gameCode = gameCode
+
+        # Player game variables
+        self.user = user
+        self.guid = guid
+        self.alive = False
+        self.playerId = -1
+        self.myShieldsCarried = 0
+        self.myShields = 0
+        self.mySmartbombsCarried = 0
+        self.mySmartbombs = 0
 
     def log(self, msg, lvl = 1):
         if self.printLog:
             prefix = ["", "INFO: ", "WARN: ", "ERR : "][lvl]
             print(prefix + msg)
+
+    def netSend(self, msg):
+        self.log("Broadcasting message: " + msg)
+        self.ws.send(msg)
 
     def netUpdate(self):
         data = self.ws.recv().split("\t")
@@ -119,20 +267,36 @@ class orbsItGame:
                 self.players[newPlayer.id] = newPlayer
 
             for o in self.gameVars["orbs"]:
-                newOrb = orbsItOrb(o)
+                newOrb = orbsItOrb(self, o)
                 self.orbs[newOrb.id] = newOrb
-                if newOrb.owner >= 0:
-                    self.players[newOrb.owner].addOrb(newOrb.id)
-        elif data[0] == self.commands["orbHit"]:
-            # TODO: scheduled takes
+        elif data[0] == self.commands["initialPlayerVars"]:
+            self.log("Received initial player variables")
+            self.playerId = int(data[1])
+            self.myShieldsCarried = int(data[2])
+            self.myShields = 2 + self.myShieldsCarried
+            self.mySmartbombsCarried = int(data[3])
+            self.mySmartbombs = 2 + self.mySmartbombsCarried
+        elif data[0] == self.commands["shoot"]:
             orbId = int(data[1])
-            oldOwner = self.orbs[orbId].owner
+            shootTime = float(data[2])
+            normal = (float(data[3]), float(data[4]))
+            self.orbs[orbId].shoot(shootTime, normal)
+            self.log("Orb " + data[1] + " shot bullet at time " + data[2] + " with direction normal (" + data[3] + ", " + data[4] + ")")
+        elif data[0] == self.commands["orbHit"]:
+            orbId = int(data[1])
             newOwner = int(data[2])
-            if oldOwner >= 0:
-                self.players[oldOwner].remOrb(orbId)
-            self.orbs[orbId].owner= newOwner
-            self.players[newOwner].addOrb(orbId)
-            self.log("Orb " + data[1] + " taken by " + data[2])
+            takeTime = float(data[3])
+
+            # If the take time is in the future, schedule it
+            if takeTime > self.gameTime:
+                # If the orb is taken before the current schedule, replace
+                if self.orbs[orbId].scheduledTakeTime <= takeTime:
+                    self.orbs[orbId].scheduledTakeTime = takeTime
+                    self.orbs[orbId].scheduledTakeBy = newOwner
+                    self.log("Orb " + data[1] + " scheduled to be taken by " + data[2] + " at time " + data[3])
+            else:
+                self.orbs[orbId].setOwner(newOwner)
+                self.log("Orb " + data[1] + " taken by " + data[2])
         elif data[0] == self.commands["eliminated"]:
             if data[1] == "0":
                 self.log("You have been eliminated")
@@ -141,6 +305,32 @@ class orbsItGame:
                 self.log("The game has ended")
                 self.inGame = False
                 self.disconnect()
+        elif data[0] == self.commands["deployShield"]:
+            targetOrb = int(data[1])
+            deployTime = float(data[2])
+            self.orbs[targetOrb].deployShield(deployTime)
+            if self.orbs[targetOrb].owner == self.playerId:
+                self.myShields -= 1
+                self.log("You have orb " + data[1] + " scheduled to deploy a shield at time " + data[2])
+            else:
+                self.log("Orb " + data[1] + " scheduled to deploy a shield at time " + data[2])
+        elif data[0] == self.commands["deploySmartbomb"]:
+            targetOrb = int(data[1])
+            deployTime = float(data[2])
+            self.orbs[targetOrb].deploySmartbomb(deployTime)
+            if self.orbs[targetOrb].owner == self.playerId:
+                self.mySmartbombs -= 1
+                self.log("You have orb " + data[1] + " scheduled to deploy a smartbomb at time " + data[2])
+            else:
+                self.log("Orb " + data[1] + " scheduled to deploy a smartbomb at time " + data[2])
+        elif data[0] == self.commands["bonusPowerup"]:
+            # TODO: myPowerupsAvailableFrom assignments and pr() call
+            if int(data[0]) == 1:
+                self.log("Received shield powerup")
+                self.myShields += 1
+            else:
+                self.log("Received smartbomb powerup")
+                self.mySmartbombs += 1
         else:
             self.log("Unknown game message:", 3)
             print(data)
@@ -151,14 +341,25 @@ class orbsItGame:
 
         self.gameTime = (int(time.time() * 1000) - self.gameStartTime) / 1000
         for i, o in self.orbs.items():
-            o.update(self.gameTime)
+            o.update()
+        killList = []
+        for b in self.bullets:
+            b.update()
+            if not b.alive():
+                killList.append(b)
+        for b in killList:
+            self.bullets.remove(b)
 
     def join(self):
         if self.inGame == True:
             lastErr = "Already ingame"
             return False
 
-        self.ws.send(str(self.commands["joinGame"]) + "\t" + self.user + "\t" + str(self.guid) + "\t" + self.joinData[2] + "\t" + self.joinData[3])
+        suffix = ""
+        if self.gameCode != None:
+            suffix += "\t" + self.gameCode
+
+        self.ws.send(str(self.commands["joinGame"]) + "\t" + self.user + "\t" + str(self.guid) + "\t" + self.joinData[2] + "\t" + self.joinData[3] + suffix)
         self.connected = True
         return True
 
@@ -172,7 +373,7 @@ class orbsItGame:
         return True
 
 class orbsIt:
-    libVersion = "0.1a"
+    libVersion = "0.2a"
 
     # Action API actions
     actions = {"reqJoinGame": 4,
@@ -321,7 +522,7 @@ class orbsIt:
         response[0] = int(response[0])
 
 
-    def requestJoinGame(self, log = True, gameCode = None, iosMode = False):
+    def requestJoinGame(self, gameCode = None, iosMode = False, log = True):
         actionDict = {"name": self.name, "sb": 0, "sh": 0, "u": self.guid}
         if gameCode != None:
             actionDict["pgc"] = gameCode
@@ -337,11 +538,13 @@ class orbsIt:
         varN = response[2]
         varS = response[3]
 
-        return orbsItGame((wsAddr, pol, varN, varS), self.name, self.guid)
+        return orbsItGame((wsAddr, pol, varN, varS), self.name, self.guid, gameCode)
 
 if __name__ == "__main__":
     import pygame
     import _thread as thread
+    import traceback
+    import sys
 
     orbs = orbsIt()
     # Example login, nothing on it
@@ -357,6 +560,7 @@ if __name__ == "__main__":
     ticker = pygame.time.Clock()
     font = pygame.font.SysFont(None, 24)
     helpText = font.render("[J]oin game; [K]ill connection; [Q]uit", True, (255, 255, 255))
+    timeText = font.render("Game not started", True, (255, 255, 255))
 
     game = None
     running = True
@@ -364,6 +568,8 @@ if __name__ == "__main__":
     dragPos = None
     camZoom = 5
     cam = [-area[0] * camZoom / 2, -area[1] * camZoom / 2]
+    selOrb = -1
+    snapTo = -1
 
     def netUpdateLoop(*args):
         while True:
@@ -375,7 +581,8 @@ if __name__ == "__main__":
                 try:
                     game.netUpdate()
                 except Exception as e:
-                    game.log(str(e), 3)
+                    game.log("An exception occurred in the network thread:", 3)
+                    traceback.print_exc(file=sys.stdout)
         game.log("Net update thread terminating")
 
     while running:
@@ -383,9 +590,25 @@ if __name__ == "__main__":
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 3:
+                if event.button == 1:
+                    if game != None:
+                        clickPos = (event.pos[0] * camZoom + cam[0], event.pos[1] * camZoom + cam[1])
+                        skipShot = False
+                        for i, o in game.orbs.items():
+                            dx = abs(clickPos[0] - o.x)
+                            dy = abs(clickPos[1] - o.y)
+                            d = math.sqrt(dx * dx + dy * dy)
+                            if d <= 25 and not drag:
+                                selOrb = i
+                                snapTo = i
+                                skipShot = True
+                                break
+                        if selOrb >= 0 and not skipShot:
+                            game.orbs[selOrb].playerShoot(clickPos)
+                elif event.button == 3:
                     drag = True
                     dragPos = event.pos
+                    snapTo = -1
                 elif event.button == 4:
                     if camZoom > 1:
                         anchor = (event.pos[0] * camZoom + cam[0], event.pos[1] * camZoom + cam[1])
@@ -420,9 +643,21 @@ if __name__ == "__main__":
                     if game != None:
                         game.disconnect()
                         game = None
+                        timeText = font.render("Disconnected", True, (255, 255, 255))
+                elif event.key == pygame.K_c:
+                    if game != None:
+                        game.orbs[selOrb].playerShield()
+                elif event.key == pygame.K_x:
+                    if game != None:
+                        game.orbs[selOrb].playerSmartbomb()
 
         if game != None:
             game.update()
+            if game.gameTime != None:
+                timeText = font.render("Game time: " + str(game.gameTime), True, (255, 255, 255))
+            if snapTo >= 0:
+                cam[0] = game.orbs[snapTo].x - area[0] * camZoom / 2
+                cam[1] = game.orbs[snapTo].y - area[1] * camZoom / 2
 
         display.fill((0,0,0))
 
@@ -431,9 +666,16 @@ if __name__ == "__main__":
                 orbColour = (127, 127, 127)
                 if o.owner >= 0:
                     orbColour = orbsItPlayer.colours[o.owner]
+                # Too lazy for transparency, so I'll just do a quick n' dirty under-draw
+                if o.shieldUp():
+                    pygame.draw.circle(display, (192, 192, 192), (int((o.x - cam[0]) / camZoom), int((o.y - cam[1]) / camZoom)), int(36.71875 / camZoom))
                 pygame.draw.circle(display, orbColour, (int((o.x - cam[0]) / camZoom), int((o.y - cam[1]) / camZoom)), int(25 / camZoom))
+            for b in game.bullets:
+                bulletColour = orbsItPlayer.colours[b.owner]
+                pygame.draw.circle(display, bulletColour, (int((b.x - cam[0]) / camZoom), int((b.y - cam[1]) / camZoom)), int(10 / camZoom))
         pygame.draw.circle(display, (255, 255, 0), (int(-cam[0] / camZoom), int(-cam[1] / camZoom)), int(80 / camZoom))
         display.blit(helpText, (0, 0))
+        display.blit(timeText, (0, 26))
 
         pygame.display.flip()
         ticker.tick(60)
